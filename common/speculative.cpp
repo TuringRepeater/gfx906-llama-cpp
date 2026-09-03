@@ -914,6 +914,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
+    std::vector<float> features_buf; // scratch: zero-feature rows for dflash gap-fill (ported from build-milp uncommitted fix)
 
     std::vector<common_sampler_ptr> smpls;
 
