@@ -805,9 +805,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+#if defined(GGML_WORKAROUND_2D_DMA_WEDGE)
+    // gfx906 KFD deadlock: large hipMemcpy2D (2D-strided) H2D transfers park in
+    // kfd_wait_on_events (repro: ~/tuning/c1d2d.cu MODE=2d 8GB x4). Tensor-split
+    // load writes every shard via this 2D path -> the KFD wedge. Emit per-shard
+    // 1D copies instead (same bytes, no 2D DMA packets).
+    const char * dst_base = (const char *) tensor->data + offset;
+    const char * src_base = (const char *) data;
+    for (size_t c = 0; c < n_copies; c++) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            (void *) (dst_base + c * stride_tensor), src_base + c * stride_data,
+            size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+#else
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+#endif
 }
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
@@ -815,9 +830,20 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+#if defined(GGML_WORKAROUND_2D_DMA_WEDGE)
+    const char * src_base = (const char *) tensor->data + offset;
+    char * dst_base = (char *) data;
+    for (size_t c = 0; c < n_copies; c++) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            (void *) (dst_base + c * stride_data), src_base + c * stride_tensor,
+            size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+#else
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+#endif
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
