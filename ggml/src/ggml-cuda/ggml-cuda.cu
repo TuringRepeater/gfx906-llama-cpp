@@ -1010,6 +1010,10 @@ struct ggml_backend_cuda_comm_context {
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
 #ifdef GGML_USE_NCCL
+    bool                        nccl_lazy_initialized = false;
+#endif // GGML_USE_NCCL
+
+#ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
@@ -1036,6 +1040,22 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     }
 
     const size_t n_backends = comm_ctx->backends.size();
+
+#if defined(GGML_LAZY_NCCL_INIT)
+    if (!comm_ctx->nccl_lazy_initialized) {
+        comm_ctx->comms.clear();
+        comm_ctx->comms.resize(n_backends);
+        ncclResult_t rc = ncclCommInitAll(comm_ctx->comms.data(), (int) n_backends, comm_ctx->dev_ids.data());
+        if (rc != ncclSuccess) {
+            comm_ctx->comms.clear();
+            GGML_LOG_WARN("lazy NCCL init failed (%s); falling back\n", ncclGetErrorString(rc));
+            return false;
+        }
+        comm_ctx->nccl_lazy_initialized = true;
+        GGML_LOG_INFO("RCCL: lazy init OK (%zu ranks, devs %s)\n", n_backends,
+                      [ids = comm_ctx->dev_ids]() -> const char* { static std::string b; for (auto d : ids) b += std::to_string(d) + ","; return b.c_str(); }());
+    }
+#endif // GGML_LAZY_NCCL_INIT
 
     for (size_t i = 0; i < n_backends; ++i) {
         GGML_ASSERT(tensors[i] != nullptr);
@@ -1213,6 +1233,14 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     }
 
     const size_t n = ret->dev_ids.size();
+#if defined(GGML_LAZY_NCCL_INIT)
+    // Deferred NCCL init: ncclCommInitAll during a large concurrent H2D model
+    // load wedges KFD on gfx906 (2-3 threads parked in kfd_wait_on_events,
+    // repro in ~/tuning/KFD-WEDGE.md). Defer until first allreduce (post-load).
+    ret->comms.resize(n);
+    ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+    ret->nccl_lazy_initialized = false;
+#else
     ret->comms.resize(n);
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
@@ -1223,6 +1251,7 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ret->comms.clear();
     GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
                   ncclGetErrorString(rc));
+#endif // GGML_LAZY_NCCL_INIT
 #else // GGML_USE_NCCL
 #ifndef GGML_USE_HIP
     GGML_LOG_WARN("NCCL not compiled in; falling back to internal AllReduce.  "
