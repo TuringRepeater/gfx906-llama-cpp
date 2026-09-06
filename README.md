@@ -139,16 +139,61 @@ HSA_OVERRIDE_GFX_VERSION=9.0.6 HIP_VISIBLE_DEVICES=0,1,2,3 \
   ./build/bin/llama-bench -m model-Q4_K_XL.gguf -ngl 99 -fa on
 ```
 
-### Reference results (Qwen3.8-Flash-Next Q4_K_XL, 4 cards, 16k ctx)
+### Reference results (Qwen3.8-Flash-Next Q4_K_XL)
 
-Paired A/B, identical harness (`llama-bench -ngl 99 -t 8 -fa on`):
+**A/B — does the downfuse kernel help?** 4 cards, `llama-bench -ngl 99 -t 8 -b 128 -fa on`.
+`llama-bench` sizes the context window from the prompt/depth, so this A/B runs at a small
+window (pp at ~512 ctx, tg at ~128 ctx). It isolates the fused MoE down-projection +
+weighted-reduction kernel (ON = default, OFF = `GGML_CUDA_DISABLE_FUSION=1`, no rebuild):
 
-| Config | tg128 | pp512 |
+| Config | pp512 (t/s) | tg128 (t/s) |
 | --- | ---: | ---: |
-| downfuse ON (default) | **19.68 ± 0.29** | 89.82 ± 2.94 |
-| downfuse OFF (`GGML_CUDA_DISABLE_FUSION=1`) | 17.81 ± 0.13 | 87.74 ± 5.77 |
+| downfuse ON (default) | 89.82 ± 2.94 | **19.68 ± 0.29** |
+| downfuse OFF (`GGML_CUDA_DISABLE_FUSION=1`) | 87.74 ± 5.77 | 17.81 ± 0.13 |
 
-Fork control before the kernel: 16.73 t/s (different harness flags — not comparable to the paired A/B).
+Re-run 2026-09-06 (clean KFD): tg128 **19.84 ± 0.27**, pp512 **92.02 ± 2.44** — consistent,
+confirming the original numbers still hold on this build.
+
+**Context sweep — best config as the context window grows.** downfuse ON, 4 cards,
+`llama-bench -ngl 99 -t 8 -b 128 -fa on`. *pp* = prompt-processing throughput for a
+prompt of that length (window = prompt length); *tg128* = token-generation throughput
+with the KV cache pre-filled to that context. The 16k row is verified; the rest are
+pending (sweep running):
+
+| Context | pp (t/s) | tg128 (t/s) |
+| --- | ---: | ---: |
+| 16k | 80.71 ± 2.17 | 16.55 ± 0.23 |
+| 32k | _pending_ | _pending_ |
+| 64k | _pending_ | _pending_ |
+| 128k | _pending_ | _pending_ |
+| 256k (model max) | _pending_ | _pending_ |
+
+> The 256k row is measured on **8 cards** — at that window the ~107 GB model plus the KV
+> cache no longer fits in 4× 32 GB HBM.
+
+Fork control before the kernel: 16.73 t/s tg (different harness flags — not comparable
+to the paired A/B).
+
+### Testing procedure
+
+- **Tool:** `llama-bench`, the context-window benchmark. It sets the context window and
+  measures prompt-processing (*pp*) and token-generation (*tg*) throughput at that depth —
+  i.e. real "usable at N tokens of context" numbers, not a fixed small prompt.
+- **pp vs tg:** *pp* = prompt tokens/sec ingested (long-context reading); *tg* = generated
+  tokens/sec (the interactive speed you feel). Both are reported per context window.
+- **How the window is set:** `llama-bench` derives the context from the prompt length and
+  pre-fill depth, so a longer prompt / deeper pre-fill allocates a larger KV cache and
+  exercises real long-context attention. *pp(C)* = process a C-token prompt (window = C);
+  *tg(C)* = generate 128 tokens with the KV pre-filled to C.
+- **Best config (4 cards):** layer-split across 4 of the 8 MI60s — the sweet spot on this
+  no-P2P board (8 cards is slower for TG; see topology). Flags: `-ngl 99 -t 8 -b 128 -fa on`,
+  downfuse ON (default).
+- **A/B isolation:** `GGML_CUDA_DISABLE_FUSION=1` switches the downfuse kernel off for an
+  exact on/off comparison with no rebuild.
+- **Model:** Qwen3.8-Flash-Next (MoE, 512 experts top-10), Q4_K_XL ≈ 107 GB, 176.9 B params.
+- **Stability note:** the gfx906 KFD driver wedges after a SIGKILL of a GPU process, so
+  runs are SIGTERM-clean and the box is rebooted between any failed test; the numbers above
+  are from clean KFD state.
 
 ### Provenance & attribution
 
