@@ -8,7 +8,7 @@ This section is meant to be a self-contained record: the hardware, what was trie
 
 ### Results at a glance
 
-| | |
+| Metric | Result |
 | --- | --- |
 | Best decode (TG) | **19.68 t/s** — 4-card layer-split, 16k ctx, downfuse kernel ON |
 | Best prefill (PP) | **~156 t/s** — 4-card layer-split, 16k ctx |
@@ -21,7 +21,7 @@ This section is meant to be a self-contained record: the hardware, what was trie
 
 This topology is what dictates the ceiling, so it's documented up front.
 
-| | |
+| Component | Detail |
 | --- | --- |
 | Motherboard | BIOSTAR TB360-BTC Pro 2.0 (Intel B360 chipset) |
 | CPU | Intel Core i3-8350K — 4 cores / 4 threads @ 4.0 GHz, 8 MiB L3, 1 NUMA node |
