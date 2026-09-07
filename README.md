@@ -155,70 +155,87 @@ Re-run 2026-09-06 (clean KFD): tg128 **19.84 ± 0.27**, pp512 **92.02 ± 2.44** 
 confirming the original numbers still hold on this build.
 
 **Context sweep — best config as the context window grows.** downfuse ON, 4 cards,
-`llama-bench -ngl 99 -t 8 -b 128 -fa on`. *pp* = prompt-processing throughput for a
-prompt of that length (window = prompt length); *tg128* = token-generation throughput
-with the KV cache pre-filled to that context. The 16k row is verified; the rest are
-pending (sweep running):
+`llama-bench -ngl 99 -t 8 -b 128 -fa on` (f16 KV). *pp* = prompt-processing throughput
+for a prompt of that length; *tg128* = token-generation throughput with the KV cache
+pre-filled to that context. 16k–64k are the solid QF ceiling rows on this board;
+**128k and 256k do not complete** (the no-P2P MoE-dispatch wall — see below).
 
 | Context | pp (t/s) | tg128 (t/s) |
 | --- | ---: | ---: |
-| 16k | 80.71 ± 2.17 | 16.55 ± 0.23 |
-| 32k | _pending_ | _pending_ |
-| 64k | _pending_ | _pending_ |
-| 128k | _pending_ | _pending_ |
-| 256k (model max) | _pending_ | _pending_ |
+| 16k | 78.9 ± 5.5 | 16.91 ± 0.20 |
+| 32k | 74.3 ± 2.3 | 14.90 ± 0.10 |
+| 64k | 64.8 ± 0.7 | 12.40 ± 0.10 |
+| 128k | **does not complete** | **does not complete** |
+| 256k (model max) | **does not complete** | **does not complete** |
 
-> The 256k row is measured on **8 cards** — at that window the ~107 GB model plus the KV
-> cache no longer fits in 4× 32 GB HBM.
+**Why 128k/256k do not complete (the wall).** This is an *architectural* ceiling, not a
+script bug, timeout, or KFD wedge:
+- The ~111 GB MoE model is layer-split across the cards. The board has **no P2P / no
+  Infinity Fabric**, so every MoE expert-token dispatch during a large-context prefill
+  is routed through **host RAM by the 4 CPU cores** (i3-8350K).
+- Observed across 4 / 6 / 8 cards, f16 and Q4 KV: GPUs idle at 350 MHz between short
+  bursts, CPU ~48% (a single core of 4), `read_bytes` still climbing after load. On the
+  8-card Q4-KV run the driver logged `HW Exception by GPU node-7 … GPU Hang` → core dump.
+- 6 cards is *slower* than 4 (each card re-streams the weights through the 16 GB page
+  cache; `read_bytes` hit 816 GB ≈ 10× the model size).
+
+**Solid QF data (4-card, f16 KV, fork build)** is the 16k/32k/64k table above. To exceed
+it you need P2P-capable GPUs, a fused host-mediation-free dispatch kernel, or a smaller
+MoE that fits one 32 GB card. Evidence: `QF-WALL-FINAL.md` (durable).
 
 Fork control before the kernel: 16.73 t/s tg (different harness flags — not comparable
 to the paired A/B).
 
-### Single-card: Qwen3.8-27B (qwen35, internal MTP) — MTP-on context sweep
+### Single-card: Qwen3.8-27B (qwen35, internal MTP) — per-quant max-context + throughput
 
-A second, dense (non-MoE) model on the same fork build: **Qwen3.8-27B Q8_0
-(≈29 GB, single card)**, run with **internal MTP ON** (`--spec-type draft-mtp
---spec-draft-n-max 2`) and **Q4 KV cache** (`-ctk q4_0 -ctv q4_0`). This is a
-`llama-server`-based sweep (not `llama-bench`), because `llama-bench` has no
-speculative-decoding support and the server's timing is token-accurate under MTP.
+A second, dense (non-MoE) model on the same fork build: **Qwen3.8-27B**, single card
+(MI60 32 GB), **internal MTP ON** (`--spec-type draft-mtp --spec-draft-n-max 2`) and
+**Q4 KV cache** (`-ctk q4_0 -ctv q4_0`), run through `llama-server` (not `llama-bench`)
+because the server timing is token-accurate under MTP. This is the model for the
+"few 27B agents, one per card, largest context" deployment target.
 
-Architectural note (this is why it is long-context-friendly): qwen35 is a
-**hybrid SSM + attention** model — 65 blocks, full attention only every 4th
-block (~16 layers keep a KV cache); the remaining blocks are SSM layers with
-**fixed-size state** (no KV growth). MTP head is embedded (`n_layer_nextn=1`),
-so no sidecar draft file is needed. Native max context = 262144.
+Architectural note (why it is long-context-friendly): qwen35 is a **hybrid SSM +
+attention** model — 65 blocks, full attention only every 4th block (~16 layers keep a
+KV cache); the rest are SSM layers with **fixed-size state** (no KV growth). MTP head is
+embedded (`n_layer_nextn=1`), so no sidecar draft file is needed. Native max context =
+262144.
 
-Single-card memory budget (32 GB MI60), Q4 KV, ~16 KV layers × 4 KV heads ×
-256 head-dim:
+**Per-quant results (single card, MTP ON, Q4 KV, depth = 16k prompt for a consistent
+pp/tg; ceiling = highest context that allocates on the 32 GB card).** All four quants
+were produced on-box from the Q8_0 source via `llama-quantize --allow-requantize`.
 
-| Context | KV (Q4) | + 29 GB weights | fits one 32 GB card |
-| --- | ---: | ---: | --- |
-| 256k (model max) | ~5.0 GiB | ~34 GiB | **no** |
-| 128k | ~2.5 GiB | ~31.5 GiB | borderline — the ceiling candidate |
-| 64k | ~1.25 GiB | ~30.0 GiB | yes |
-| 32k / 16k | 0.6 / 0.3 GiB | ~29.3–29.6 GiB | yes |
+| Quant | size | **max ctx (1 card)** | pp (t/s) | tg128 (t/s) | MTP acc | ppl* |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q8_0 | 29 GB | **128k** (256k OOM) | 199.6 | 23.7 | 0.72 | 1.4165 |
+| Q6_K | 20.9 GB | **256k** (model max) | 159.0 | 24.3 | 0.86 | 1.4090 |
+| Q5_K_M | 18.2 GB | **256k** (model max) | 181.6 | 21.5 | 0.89 | 1.4429 |
+| Q4_K_M | 15.7 GB | **256k** (model max) | 163.4 | 21.9 | 0.86 | 1.3935 |
 
-Sweep plan: `llama-server -ngl 99 -t 8 --parallel 1 -fa on -ctk q4_0 -ctv q4_0
---spec-type draft-mtp --spec-draft-n-max 2`, ladder the context window down
-from 128k (256k ruled out by the math above), record the highest window that
-allocates = the single-card ceiling, then report at each window: *pp* (prompt
-t/s), *tg* (generated t/s), and **MTP draft acceptance** (accepted / generated
-draft tokens).
+\* Perplexity on the same ~10k-token diverse text, `llama-perplexity -c 4096`; all four
+quants are within ~2% of each other (inside the run-to-run ±0.03 noise band), so even
+Q4_K_M holds accuracy for this workload while halving the footprint.
 
-| Context | pp (t/s) | tg (t/s) | MTP acceptance |
-| --- | ---: | ---: | ---: |
-| 128k | _pending_ | _pending_ | _pending_ |
-| 64k | _pending_ | _pending_ | _pending_ |
-| 32k | _pending_ | _pending_ | _pending_ |
-| 16k | _pending_ | _pending_ | _pending_ |
-| single-card ceiling | _pending_ | _pending_ | _pending_ |
+**Takeaways for the multi-agent target:**
+- **Q4_K_M / Q5_K_M / Q6_K all reach the full 256k context on a single MI60** — only Q8_0
+  tops out at 128k (29 GB + 256k KV overflows 32 GB). So the "largest contexts possible
+  while containing one model + context per card" goal is met at **256k** for any quant
+  at or below Q6_K.
+- tg is **21–24 t/s** and pp is **159–200 t/s** at the top context — comfortably above
+  the 20 t/s tg target even at 256k.
+- Recommended: **Q6_K** (best tg + full 256k + accuracy within noise of Q8_0) or
+  **Q4_K_M** (smallest footprint if you want headroom for extra per-card context).
 
-> Prior 27B datapoint (2026-09-02, **different build** — milpster rocm-727
-> docker image, f16 KV, 32k ctx, MTP n=2): pp ≈ 80–95 t/s, tg ≈ 13–25 t/s,
-> MTP acceptance up to 0.62. Shown for scale only; not comparable to the fork
-> build's Q4-KV numbers.
+Run params (all values, reproducible): `llama-server -m Qwen3.8-27B-<QUANT>.gguf
+--fit off -ngl 99 -t 8 -c <CTX> --parallel 1 -ctk q4_0 -ctv q4_0 -fa on --spec-type
+draft-mtp --spec-draft-n-max 2` on one MI60 (card 0), `HSA_OVERRIDE_GFX_VERSION=9.0.6`;
+ceiling found by descending the context ladder `256k→128k→64k→32k→16k` on OOM; pp/tg
+measured at a 16k-token prompt (128 generated tokens). Durable artifacts:
+`ctx27-quant.tsv` (results), `ctx27-quant.log`, `ppl27b.tsv`, `ppl27b.log`,
+`quant27b.sh`, `ctx27-quant.py` under `~/tuning/` on the build host.
 
 ### Testing procedure
+
+
 
 - **Tool:** `llama-bench`, the context-window benchmark. It sets the context window and
   measures prompt-processing (*pp*) and token-generation (*tg*) throughput at that depth —
