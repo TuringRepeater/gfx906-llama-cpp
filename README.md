@@ -227,6 +227,32 @@ attention model tg degrades with KV depth. So we also ran **at true 256k context
 
 *(server `eval time`, authoritative — `ctx27-256k.log`).*
 
+**tg-vs-context curve (the decision curve).** tg degrades monotonically as the
+KV cache fills (dense attention over the full context dominates per-token cost).
+Full sweep, one MI60, MTP ON, Q4 KV, ~78% of ctx in the prompt (128 gen):
+
+| ctx | Q6_K pp | Q6_K tg | Q4_K_M pp | Q4_K_M tg |
+| ---: | ---: | ---: | ---: | ---: |
+| 16k*  | 159.0 | **24.3** | 163.4 | **21.9** |
+| 64k   | 136.8 | **19.58** | 139.7 | **17.50** |
+| 128k  | 113.8 | **15.22** | 116.0 | **14.28** |
+| 192k  | 97.3  | **13.08** | 99.0  | **12.14** |
+| 256k  | 96.5  | **12.06** | 98.0  | **12.14** |
+
+*16k row from `ctx27-quant.tsv`; 64k–256k rows from `ctx27-curve.tsv` /
+`ctx27-256k.tsv` (all server `eval time`, authoritative).*
+
+**The 20 t/s tg line is crossed between 16k and 64k context.** Concretely for
+the multi-agent target ("largest context per card while staying ≥ 20 t/s tg"):
+- **≥ 20 t/s tg** → cap context at **~48k** (interpolated; 64k is 19.6 for Q6_K).
+- **64k ctx** → ~19.6 t/s (just under target).
+- **128k ctx** → ~15 t/s.
+- **256k ctx** (max) → ~12 t/s.
+
+So the trade is explicit: **256k context costs ~2× tg vs. ~48k**. If the agents
+need 20+ t/s, run them at ~48k context per card; if they need 256k, budget for
+~12 t/s (or lean on MTP, already ON, which is why tg holds at all).
+
 **Takeaways for the multi-agent target (corrected):**
 - **Q4_K_M / Q5_K_M / Q6_K all reach the full 256k context on a single MI60** — only
   Q8_0 tops out at 128k (29 GB + 256k KV overflows 32 GB). The "largest context per
@@ -235,9 +261,9 @@ attention model tg degrades with KV depth. So we also ran **at true 256k context
   table is the *shallow-context* (16k KV) figure; dense attention over 156k tokens
   dominates per-token cost, so tg falls to ~12 as context fills. pp stays strong
   (~97–98 t/s) at 256k.
-- If 20 t/s tg is a hard floor for the agents, **context must be capped below ~256k**
-  (the tg-vs-context curve is the next thing to map). If 256k context is the hard
-  requirement, accept ~12 t/s tg, or add MTP (accept ≈ 0.86–0.89 already included).
+- If 20 t/s tg is a hard floor for the agents, **cap context at ~48k** (see the
+  tg-vs-context curve below). If 256k context is the hard requirement, accept ~12 t/s
+  tg. MTP is already ON (accept ≈ 0.86–0.89), which is what keeps tg usable at depth.
 - Accuracy: Q4_K_M ppl 1.3935 is within ~2% of Q8_0 (inside the ±0.03 noise band) —
   Q4_K_M is accuracy-equivalent while halving footprint and still hitting 256k.
 
