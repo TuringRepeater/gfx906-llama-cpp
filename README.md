@@ -204,7 +204,7 @@ embedded (`n_layer_nextn=1`), so no sidecar draft file is needed. Native max con
 pp/tg; ceiling = highest context that allocates on the 32 GB card).** All four quants
 were produced on-box from the Q8_0 source via `llama-quantize --allow-requantize`.
 
-| Quant | size | **max ctx (1 card)** | pp (t/s) | tg128 (t/s) | MTP acc | ppl* |
+| Quant | size | **max ctx (1 card)** | pp (t/s) | tg (t/s) | MTP acc | ppl* |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Q8_0 | 29 GB | **128k** (256k OOM) | 199.6 | 23.7 | 0.72 | 1.4165 |
 | Q6_K | 20.9 GB | **256k** (model max) | 159.0 | 24.3 | 0.86 | 1.4090 |
@@ -215,23 +215,39 @@ were produced on-box from the Q8_0 source via `llama-quantize --allow-requantize
 quants are within ~2% of each other (inside the run-to-run ±0.03 noise band), so even
 Q4_K_M holds accuracy for this workload while halving the footprint.
 
-**Takeaways for the multi-agent target:**
-- **Q4_K_M / Q5_K_M / Q6_K all reach the full 256k context on a single MI60** — only Q8_0
-  tops out at 128k (29 GB + 256k KV overflows 32 GB). So the "largest contexts possible
-  while containing one model + context per card" goal is met at **256k** for any quant
-  at or below Q6_K.
-- tg is **21–24 t/s** and pp is **159–200 t/s** at the top context — comfortably above
-  the 20 t/s tg target even at 256k.
-- Recommended: **Q6_K** (best tg + full 256k + accuracy within noise of Q8_0) or
-  **Q4_K_M** (smallest footprint if you want headroom for extra per-card context).
+**Two context depths matter — measure both.** The table above is at a **~16k-token
+prompt** (shallow KV). But the deployment target is *max* context, and for a dense
+attention model tg degrades with KV depth. So we also ran **at true 256k context**
+(KV pre-filled with a ~156k-token prompt, 128 generated):
 
-Run params (all values, reproducible): `llama-server -m Qwen3.8-27B-<QUANT>.gguf
---fit off -ngl 99 -t 8 -c <CTX> --parallel 1 -ctk q4_0 -ctv q4_0 -fa on --spec-type
+| Quant | ctx | pp @256k (t/s) | **tg @256k (t/s)** |
+| --- | ---: | ---: | ---: |
+| Q6_K | 256k | 96.5 | **12.06** |
+| Q4_K_M | 256k | 98.0 | **12.14** |
+
+*(server `eval time`, authoritative — `ctx27-256k.log`).*
+
+**Takeaways for the multi-agent target (corrected):**
+- **Q4_K_M / Q5_K_M / Q6_K all reach the full 256k context on a single MI60** — only
+  Q8_0 tops out at 128k (29 GB + 256k KV overflows 32 GB). The "largest context per
+  card" goal is met at **256k** for any quant ≤ Q6_K.
+- **But tg at 256k context is ~12 t/s, below the 20 t/s target.** The 21–24 t/s in the
+  table is the *shallow-context* (16k KV) figure; dense attention over 156k tokens
+  dominates per-token cost, so tg falls to ~12 as context fills. pp stays strong
+  (~97–98 t/s) at 256k.
+- If 20 t/s tg is a hard floor for the agents, **context must be capped below ~256k**
+  (the tg-vs-context curve is the next thing to map). If 256k context is the hard
+  requirement, accept ~12 t/s tg, or add MTP (accept ≈ 0.86–0.89 already included).
+- Accuracy: Q4_K_M ppl 1.3935 is within ~2% of Q8_0 (inside the ±0.03 noise band) —
+  Q4_K_M is accuracy-equivalent while halving footprint and still hitting 256k.
+
+Run params (reproducible): `llama-server -m Qwen3.8-27B-<QUANT>.gguf --fit off
+-ngl 99 -t 8 -c <CTX> [-b 4096] --parallel 1 -ctk q4_0 -ctv q4_0 -fa on --spec-type
 draft-mtp --spec-draft-n-max 2` on one MI60 (card 0), `HSA_OVERRIDE_GFX_VERSION=9.0.6`;
-ceiling found by descending the context ladder `256k→128k→64k→32k→16k` on OOM; pp/tg
-measured at a 16k-token prompt (128 generated tokens). Durable artifacts:
-`ctx27-quant.tsv` (results), `ctx27-quant.log`, `ppl27b.tsv`, `ppl27b.log`,
-`quant27b.sh`, `ctx27-quant.py` under `~/tuning/` on the build host.
+ceiling by descending `256k→128k→64k→32k→16k` on OOM; shallow pp/tg at a ~16k-token
+prompt, deep pp/tg at a ~156k-token prompt (128 generated). Durable artifacts:
+`ctx27-quant.tsv` (shallow), `ctx27-256k.tsv` + `ctx27-256k.log` (deep),
+`ppl27b.tsv`, `quant27b.sh`, `ctx27-quant.py`, `ctx27-256k.py` under `~/tuning/`.
 
 ### Testing procedure
 
