@@ -174,6 +174,50 @@ pending (sweep running):
 Fork control before the kernel: 16.73 t/s tg (different harness flags — not comparable
 to the paired A/B).
 
+### Single-card: Qwen3.8-27B (qwen35, internal MTP) — MTP-on context sweep
+
+A second, dense (non-MoE) model on the same fork build: **Qwen3.8-27B Q8_0
+(≈29 GB, single card)**, run with **internal MTP ON** (`--spec-type draft-mtp
+--spec-draft-n-max 2`) and **Q4 KV cache** (`-ctk q4_0 -ctv q4_0`). This is a
+`llama-server`-based sweep (not `llama-bench`), because `llama-bench` has no
+speculative-decoding support and the server's timing is token-accurate under MTP.
+
+Architectural note (this is why it is long-context-friendly): qwen35 is a
+**hybrid SSM + attention** model — 65 blocks, full attention only every 4th
+block (~16 layers keep a KV cache); the remaining blocks are SSM layers with
+**fixed-size state** (no KV growth). MTP head is embedded (`n_layer_nextn=1`),
+so no sidecar draft file is needed. Native max context = 262144.
+
+Single-card memory budget (32 GB MI60), Q4 KV, ~16 KV layers × 4 KV heads ×
+256 head-dim:
+
+| Context | KV (Q4) | + 29 GB weights | fits one 32 GB card |
+| --- | ---: | ---: | --- |
+| 256k (model max) | ~5.0 GiB | ~34 GiB | **no** |
+| 128k | ~2.5 GiB | ~31.5 GiB | borderline — the ceiling candidate |
+| 64k | ~1.25 GiB | ~30.0 GiB | yes |
+| 32k / 16k | 0.6 / 0.3 GiB | ~29.3–29.6 GiB | yes |
+
+Sweep plan: `llama-server -ngl 99 -t 8 --parallel 1 -fa on -ctk q4_0 -ctv q4_0
+--spec-type draft-mtp --spec-draft-n-max 2`, ladder the context window down
+from 128k (256k ruled out by the math above), record the highest window that
+allocates = the single-card ceiling, then report at each window: *pp* (prompt
+t/s), *tg* (generated t/s), and **MTP draft acceptance** (accepted / generated
+draft tokens).
+
+| Context | pp (t/s) | tg (t/s) | MTP acceptance |
+| --- | ---: | ---: | ---: |
+| 128k | _pending_ | _pending_ | _pending_ |
+| 64k | _pending_ | _pending_ | _pending_ |
+| 32k | _pending_ | _pending_ | _pending_ |
+| 16k | _pending_ | _pending_ | _pending_ |
+| single-card ceiling | _pending_ | _pending_ | _pending_ |
+
+> Prior 27B datapoint (2026-09-02, **different build** — milpster rocm-727
+> docker image, f16 KV, 32k ctx, MTP n=2): pp ≈ 80–95 t/s, tg ≈ 13–25 t/s,
+> MTP acceptance up to 0.62. Shown for scale only; not comparable to the fork
+> build's Q4-KV numbers.
+
 ### Testing procedure
 
 - **Tool:** `llama-bench`, the context-window benchmark. It sets the context window and
