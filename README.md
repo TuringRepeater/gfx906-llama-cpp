@@ -108,6 +108,94 @@ Chronological, so the reasoning is reproducible. Steps 1–3 established the bas
 - **More GPUs can be worse.** With no P2P and host-mediated allreduce, 8 cards was slower than 4. Card count is a *topology* variable, not a monotonic one.
 - **Gate experiments opt-in.** Every change here is a compile flag or env var off by default, so the fork stays drop-in safe on other archs.
 
+
+### QF 128k-context wall - root cause: a 27.5 GiB host-resident tensor on a 16 GiB box
+
+**Finding (measured, not inferred).** Qwen3.8-Flash-Next carries a **27.47 GiB tensor
+(`per_layer_token_embd.weight`) that cannot be placed on any GPU in this build and does
+not fit in the box's total host RAM**. It is therefore served as a host-mapped
+lazy-read buffer, and long-context prompt processing is throttled to NVMe speed while
+the GPUs sit idle. This is a **placement failure**, not a compute, KV, or context-window
+limit.
+
+**Evidence chain**
+
+1. **Placement (load log, ctx 128k):** `offloaded 49/49 layers to GPU`; memory
+   breakdown:
+
+   | Device | model buffer |
+   |---|---:|
+   | ROCm0 | 21297 MiB |
+   | ROCm1 | 18981 MiB |
+   | ROCm2 | 19231 MiB |
+   | ROCm3 | 18548 MiB |
+   | CPU_Mapped (other) | 644 MiB |
+   | **CPU_Mapped (PLE, `lazy read enabled`)** | **27466 MiB** |
+
+   Fit engine: projected 89,009 MiB vs 130,186 MiB free - the run "fits" with headroom;
+   the host tensor is invisible to it.
+
+2. **The tensor's shape (arch KV):** PLE = one hashed n-gram embedding layer at layer 1
+   (`ple.ngram_size=3`, `heads_per_ngram=8` -> **16 hashed heads**); per-token gather is
+   16 rows of width 160 (`embedding_length_per_layer_input=160`) - about 1.4 KB of *data*
+   per token. Per-head vocab is about 20M rows (about 320M rows total, padded);
+   28.8 GB / 320M rows is about **90 B/row -> quantized (q4-class), not f16** (derived
+   from size divided by rows; exact dtype not yet confirmed from the gguf).
+
+3. **Observed throughput curve (4 cards, same build):**
+
+   | context | pp (t/s) | outcome |
+   |---:|---:|---|
+   | 16k | 78.9 | fine |
+   | 32k | 74.3 | fine |
+   | 64k | 64.8 | degraded |
+   | 128k | timeout (90 min cap) | never completes |
+
+4. **diag2 (128k prefill, 10 s sampling):** `read_bytes` climbed **577 GB** at about
+   230 MB/s (about 5x the model size) *after* load; `rchar` flat (mmap page-faults, not
+   `read()` syscalls); `MemAvailable` pinned at **1 MiB**; GPUs 0-4% busy at base clock.
+   The GPUs were waiting on host memory the whole window.
+
+5. **dmesg:** `amdgpu: init_user_pages: Failed to get user pages: -1` x635 - the GPU
+   could not pin host pages for the host-resident tensor; the unpinned fallback
+   (page-cache -> NVMe) is the slow path that item 4 shows in action.
+
+6. **Per-context prefill disk sweep (measured, cold-cache, `drop_caches` per run, 1 prefill each via `llama-bench -r 1 --no-warmup`):** prefill-phase NVMe traffic scales with context, roughly linearly; load phase is constant. This is the context-scaling behavior, measured rather than fitted.
+
+   | context | prefill NVMe | pp (t/s) | load NVMe | min MemAvail (prefill) |
+   |---:|---:|---:|---:|---:|
+   | 16k | 20.3 GiB | 87.2 | 139.0 GiB | 531 MiB |
+   | 32k | 56.7 GiB | 80.8 | 134.8 GiB | 4.9 GiB |
+   | 64k | 87.5 GiB | 78.3 | 140.6 GiB | 544 MiB |
+
+   64k is **4.3x** the prefill disk work of 16k for 4x the context. Two caveats: (a) the magnitude exceeds a minimal touched-rows model (16k touches ~23 MB of PLE *data* yet 20 GiB hit NVMe) - page-granular lazy-read faulting adds amplification not yet decomposed; (b) prefill is disk-bound at **every** context, not only the long ones - 16k is "tolerable," not "cache-resident."
+
+**Process - what was tried and what each showed**
+
+| Probe | Result |
+|---|---|
+| `--no-mmap` | **Loud OOM** (`cudaMalloc failed` at 18.1 GiB) - confirms RAM is the binding constraint; the failure mode we wanted |
+| `--no-host` (load only) | Loads (87.6 GiB VRAM); PLE moves to host *anon* RAM. Then the **128k end-to-end test never finished loading in 93 min** - VRAM plateaued ~84-90 GiB of the 103.7 GiB model, disk reads reached **1,315 GiB** (~12x model size), MemAvailable ~2.4 GB, swap active: a **stable swap-thrash equilibrium** that will not converge on 16 GiB RAM. Killed by operator decision (single SIGTERM, clean exit, no wedge). Record: `~/tuning/QF-16GB-CEILING.md` |
+| `-sm row` / tensor split | `error: device ROCm0 does not support split buffers` - the HIP backend does not implement split buffers; the 27.5 GiB table cannot be row-split across cards in this build |
+| `-ot <pat>=<device>` | Single-buffer types only (`ROCm0..3`, `CPU`); 27.5 GiB does not fit any single card's free slice (~8-13 GiB) |
+| KV quant / `--kv-unified` | KV at 128k is ~1.1 GiB f16 (12 KV layers x 256-dim) - not the tensor in question; no effect |
+| Load ordering | The loader is already sequential per tensor through a 4x64 MB pinned ring (`llama-model-loader.cpp`); concurrency is not the cause of the thrash |
+
+**Honest limits of the diagnosis**
+
+- **What is proven:** the PLE is 27.5 GiB, host-resident, and bigger than the box's RAM -
+  a hard, context-independent ceiling. `--no-host` 128k did not load in 93 min.
+- **What is measured vs. still open:** the *context scaling is now measured* (evidence
+  item 6: prefill NVMe 20.3 / 56.7 / 87.5 GiB at 16k / 32k / 64k, ~linear in context,
+  tracking the pp drop 87 -> 78 t/s). What remains open is the *exact per-token
+  amplification*: the PLE gather is 16 rows of width 160 per token (~1.4 KB of data),
+  but prefill faults in far more bytes than that (page-granular lazy-read; ~20 GiB at
+  16k), so the row-level multiplier is not yet decomposed. The PLE's exact gguf dtype
+  is also still derived (~90 B/row -> q4-class), not confirmed from the file.
+- **Not a code bug, not a flag:** `--fit off`/`--fit on`, KV quant, and `--kv-unified`
+  all leave the PLE exactly where it is. The 27B dense model has no such tensor and runs
+  256k fine on a single card - the wall is specific to QF's PLE on a RAM-constrained box.
+
 ### Open questions / next steps (for anyone building on this)
 
 - **The KFD 2D-DMA wedge** is the real blocker for tensor-split. The workaround (1D copies) reduces exposure but the durable fix is a **ROCm/KFD driver or HSA runtime update** that fixes the large strided-DMA deadlock. A box with a working P2P path (Infinity Fabric, or a proper GPU switch) would remove the host-mediated allreduce term entirely.
