@@ -170,6 +170,22 @@ limit.
 
    64k is **4.3x** the prefill disk work of 16k for 4x the context. Two caveats: (a) the magnitude exceeds a minimal touched-rows model (16k touches ~23 MB of PLE *data* yet 20 GiB hit NVMe) - page-granular lazy-read faulting adds amplification not yet decomposed; (b) prefill is disk-bound at **every** context, not only the long ones - 16k is "tolerable," not "cache-resident."
 
+   **A/B: does the host backing matter? `--no-host` (PLE in host *anon* RAM) vs default
+   (file-backed lazy), same 3 contexts (measured, `nohost_ctxdisk.sh`):**
+
+   | context | pp default | pp `--no-host` | prefill NVMe default | prefill NVMe `--no-host` |
+   |---:|---:|---:|---:|---:|
+   | 16k | 87.2 | 82.1 | 20.3 GiB | 27.5 GiB |
+   | 32k | 80.8 | 84.3 | 56.7 GiB | 42.2 GiB |
+   | 64k | 78.3 | 77.2 | 87.5 GiB | 97.8 GiB |
+
+   Within ~5-6% (run variance); disk-bound prefill persists under anon-RAM backing and
+   still scales with context (~3.6x). So the cost is the *placement* (27.5 GiB on a
+   16 GiB box), not the *backing*. Negative result worth keeping: `--no-host` loaded
+   fine at all three contexts - the 93-min load pathology was specific to 128k, where
+   working-set pressure finally tips anon RAM into swap. No flag rescues long-context
+   QF on this box; the RAM upgrade remains the fix.
+
 **Process - what was tried and what each showed**
 
 | Probe | Result |
